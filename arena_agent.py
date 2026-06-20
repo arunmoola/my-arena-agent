@@ -22,8 +22,8 @@ ID_TOKEN       = os.environ["ARENA_ID_TOKEN"]
 MAX_TURNS      = 20
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TRACELOOP_API_KEY=os.environ["TRACELOOP_API_KEY"]
-GITHUB_URL="github.com/aruprasad/my-arena-agent"
-LINKED_IN_URL="linkedin.com/in/aruprasad"
+GITHUB_URL="github.com/arunprasad/my-arena-agent"
+LINKED_IN_URL="linkedin.com/in/arunprasad"
 
 SYSTEM_PROMPT = f"""
 You are an autonomous agent that solves programming tasks in a competitive arena.
@@ -118,30 +118,43 @@ def make_arena_tools(state: RunState):
 
     return [register_agent, get_tasks, submit_task, skip_task]
 
-async def run_turn(runner, session_id, message):
+async def run_turn(runner, user_id, session_id, message):
     """Send one message; collect and return the agent's final text reply."""
     content = genai_types.Content(role="user", parts=[genai_types.Part(text=message)])
-    async for event in runner.run_async(session_id=session_id, new_message=content):
-        if getattr(event, "turn_complete", False):
-            return event.content.parts[0].text
+    reply = None
+    async for event in runner.run_async(
+        user_id=user_id, session_id=session_id, new_message=content):
+        if event.content and event.content.parts and event.content.parts[0].text:
+            reply = event.content.parts[0].text
+    return reply
         
 def build_agent(state: RunState) -> LlmAgent:
-    return LLMAgent(
+    return LlmAgent(
         name=AGENT_NAME,
         model=MODEL,
         tools=make_arena_tools(state),
-        system_prompt=SYSTEM_PROMPT,
+        instruction=SYSTEM_PROMPT,
         generate_content_config=genai_types.GenerateContentConfig(
-            temperature=0.2, 
+            temperature=0.2,
             max_output_tokens=4096),
     )
+
+APP_NAME = "arena-agent"
+USER_ID  = AGENT_NAME
+
 
 async def main():
     state = RunState()
     agent = build_agent(state)
     sessions = InMemorySessionService()
-    await sessions.create_session(session_id=state.run_id)
-    runner = Runner(agent=agent, session_service=sessions)
+    await sessions.create_session(
+        app_name=APP_NAME, user_id=USER_ID, session_id=state.run_id)
+    runner = Runner(app_name=APP_NAME, agent=agent, session_service=sessions)
     # Turn 1: Kickoff
-    reply = await run_turn(runner, state.run_id, "Start now. Register and solve tasks.")
+    reply = await run_turn(
+        runner, USER_ID, state.run_id, "Start now. Register and solve tasks.")
     print(f"Agent: {reply}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
