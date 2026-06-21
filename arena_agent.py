@@ -35,7 +35,7 @@ from prompts import build_task_prompt, build_solver_prompt, detect_task_type
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Change these three lines ──────────────────────────────
-AGENT_NAME  = "manduke_v4"          # shown on the leaderboard
+AGENT_NAME  = "manduke_v5"          # shown on the leaderboard
 AGENT_STACK = "Python / ADK / Groq" # describe your stack
 # Local Ollama (free) — needs `ollama serve` + the model pulled. Use the
 # ollama_chat/ prefix for reliable tool-calling. Swap to a "gemini-2.5-*"
@@ -49,8 +49,9 @@ AGENT_STACK = "Python / ADK / Groq" # describe your stack
 # Two-model split: a small reliable model ORCHESTRATES (drives the MCP tools),
 # a capable model SOLVES (produces the answer). They use separate Groq rate-limit
 # buckets, so heavy reasoning tokens don't starve the tool-calling loop.
-MODEL        = "groq/llama-3.1-8b-instant"      # ORCHESTRATOR — tool calls
-SOLVER_MODEL = "groq/llama-3.3-70b-versatile"   # SOLVER — reasoning / the answer
+MODEL        = "groq/llama-3.3-70b-versatile"   # ORCHESTRATOR — tool calls (12k TPM, reliable)
+SOLVER_MODEL = "groq/openai/gpt-oss-120b"       # SOLVER — reasoning (separate 8k bucket; tool-less,
+                                                # so the reasoning_content 400 never applies here)
 APP_NAME = "arena-adk-agent"
 USER_ID  = AGENT_NAME
 
@@ -76,10 +77,14 @@ def _transient_retry_after(exc: Exception, max_wait: float = MAX_WAIT_SECS) -> O
         return None
     if "tokens per day" in blob or "(tpd)" in blob:
         return None                          # daily cap — not worth waiting out
-    m = re.search(r"try again in ([\d.]+)s", blob)
+    # Groq phrases the reset as seconds ("8.5s") OR milliseconds ("295ms").
+    # Match both — missing the ms form made tiny sub-second waits look like a
+    # hard failure and bail when a ~0.3s pause would have let it continue.
+    m = re.search(r"try again in ([\d.]+)\s*(ms|s)\b", blob)
     if not m:
         return None
-    wait = float(m.group(1))
+    value = float(m.group(1))
+    wait = value / 1000.0 if m.group(2) == "ms" else value
     return wait + 1.0 if wait <= max_wait else None   # +1s buffer past the reset
 
 
@@ -114,7 +119,11 @@ def resolve_model(model: str):
     # num_retries=0: bare litellm.acompletion retries EVERY exception (incl.
     # non-retryable 400s) and doesn't reliably sleep retry-after. We pace
     # transient 429s in PacedLiteLlm and let run_turn bail on the rest.
-    return PacedLiteLlm(model=model, num_retries=0)
+    # parallel_tool_calls=False: force ONE tool call per turn so the model must
+    # observe each result before the next call — otherwise it fires register +
+    # get_tasks + solve_task + submit_task at once, submitting a placeholder
+    # before solve_task returns and using a hallucinated agent_id.
+    return PacedLiteLlm(model=model, num_retries=0, parallel_tool_calls=False)
 
 
 # ── Solver (separate model, no tools) ─────────────────────────────────────────
@@ -677,13 +686,9 @@ async def _drive(
         print(f"{'━'*60}")
 
         # ── Single-turn solve ─────────────────────────────────────────────────
-        # Create a dedicated clean session ID for the execution turn
-        task_session_id = f"{state.run_id}-task-{task_num}"
-        await session_service.create_session(
-            app_name=APP_NAME,
-            user_id=USER_ID,
-            session_id=task_session_id,
-        )
+        # Reuse the run's ONE session (state.run_id) — a fresh per-task session
+        # made the orchestrator forget it had registered, so it re-registered and
+        # hallucinated agent_id (the name), and every call 404'd as AGENT_NOT_FOUND.
         prev_attempted = state.tasks_attempted
         prompt = (
             f"Your current task '{task_title}' (task_id='{state.task_id}') is ready. "
@@ -693,7 +698,7 @@ async def _drive(
             f"Do not write code or solve it yourself; do not alter the answer."
         )
         _log("AGENT", "Orchestrating: solve_task -> submit_task ...")
-        await run_turn(runner, session_service, task_session_id, prompt)
+        await run_turn(runner, session_service, state.run_id, prompt)
 
         # ── Verify submission ─────────────────────────────────────────────────
         if state.tasks_attempted > prev_attempted:
