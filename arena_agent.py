@@ -44,9 +44,9 @@ AGENT_STACK = "Python / ADK / Groq" # describe your stack
 # MODEL = "groq/llama-3.3-70b-versatile"   # proven (reached L2), but tight 12k TPM
 # MODEL = "groq/meta-llama/llama-4-scout-17b-16e-instruct"  # unreliable tool calls
 # MODEL = "groq/qwen/qwen3.6-27b"
-MODEL = "groq/openai/gpt-oss-120b"          # strong tool calling, roomier limits
+# MODEL = "groq/openai/gpt-oss-120b"          # strong tool calling, roomier limits but content not supported
 # MODEL = "groq/meta-llama/llama-prompt-guard-2-86m" # no tool calling support
-# MODEL = "groq/llama-3.1-8b-instant"
+MODEL = "groq/llama-3.1-8b-instant"
 APP_NAME = "arena-adk-agent"
 USER_ID  = AGENT_NAME
 
@@ -61,18 +61,55 @@ TRACELOOP_API_KEY=os.environ["TRACELOOP_API_KEY"]
 GITHUB_URL="https://github.com/arunmoola/my-arena-agent"
 LINKEDIN_URL="https://linkedin.com/in/arunprasad"
 
+def _transient_retry_after(exc: Exception, max_wait: float = 30.0) -> Optional[float]:
+    """Seconds to wait for a TRANSIENT per-minute (TPM) rate limit, read from the
+    server's 'try again in Ns'. Returns None for per-day (TPD) caps or anything
+    that isn't a short, waitable rate limit — those should bail, not wait."""
+    name = type(exc).__name__.lower()
+    blob = str(exc).lower()
+    if "ratelimit" not in name and "rate_limit" not in blob:
+        return None
+    if "tokens per day" in blob or "(tpd)" in blob:
+        return None                          # daily cap — not worth waiting out
+    m = re.search(r"try again in ([\d.]+)s", blob)
+    if not m:
+        return None
+    wait = float(m.group(1))
+    return wait + 1.0 if wait <= max_wait else None   # +1s buffer past the reset
+
+
+class PacedLiteLlm(LiteLlm):
+    """LiteLlm that waits out a transient (per-minute) rate limit and retries the
+    SINGLE failed model call. A 429 fails before the generator yields, so this is
+    safe — and crucially it does NOT restart the agent turn (which would replay
+    earlier tool calls like get_tasks). Permanent / daily-cap errors re-raise."""
+    async def generate_content_async(self, llm_request, stream: bool = False):
+        attempt = 0
+        while True:
+            try:
+                async for resp in super().generate_content_async(llm_request, stream=stream):
+                    yield resp
+                return
+            except Exception as e:
+                wait = _transient_retry_after(e)
+                if wait is None or attempt >= 3:
+                    raise
+                attempt += 1
+                _log("WARN", f"TPM rate limit — pacing {wait:.0f}s then retrying the "
+                             f"model call (attempt {attempt}/3)")
+                await asyncio.sleep(wait)
+
+
 def resolve_model(model: str):
-    """ADK speaks Gemini natively, so a bare "gemini-*" string is passed
-    through. Anything else (groq/, openrouter/, mistral/, openai/, ollama_chat/,
-    ...) is a LiteLLM provider route and gets wrapped in LiteLlm."""
+    """ADK speaks Gemini natively, so a bare "gemini-*" string is passed through.
+    Anything else is a LiteLLM provider route, wrapped in PacedLiteLlm so transient
+    TPM rate limits are waited out at the model-call layer, not the turn layer."""
     if model.startswith("gemini"):
         return model
-    # num_retries=0: bare litellm.acompletion (what ADK's LiteLlm calls) treats
-    # num_retries as a blanket count that retries EVERY exception — including
-    # non-retryable 400s (tool_use_failed, reasoning_content) — because the
-    # per-error RetryPolicy / _should_retry logic only runs via litellm.Router.
-    # So we disable LiteLLM's retries and let run_turn classify + bail/retry.
-    return LiteLlm(model=model, num_retries=0)
+    # num_retries=0: bare litellm.acompletion retries EVERY exception (incl.
+    # non-retryable 400s) and doesn't reliably sleep retry-after. We pace
+    # transient 429s in PacedLiteLlm and let run_turn bail on the rest.
+    return PacedLiteLlm(model=model, num_retries=0)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging helpers
@@ -469,6 +506,9 @@ async def run_turn(
 
     final_text = ""
     try:
+        # Transient TPM rate limits are paced inside PacedLiteLlm (model layer),
+        # so a turn is never restarted mid-flight. Anything that reaches here is
+        # a real failure.
         async for event in runner.run_async(
             user_id=USER_ID,
             session_id=session_id,
@@ -492,15 +532,14 @@ async def run_turn(
                 elif hasattr(part, "text") and part.text and event.turn_complete:
                     final_text = part.text
     except Exception as e:
-        # Log a single clean line instead of the full ADK/LiteLLM stack trace.
-        # str(e) on LiteLLM errors still carries the useful detail (e.g. the
-        # rate-limit "try again in Ns" message) on one line.
+        # One clean line instead of the full ADK/LiteLLM stack trace.
         msg = " ".join(str(e).split())
         _log("ERROR", f"run_turn aborted: {type(e).__name__}: {msg}")
         if _is_unrecoverable(e):
             # Don't let the caller retry into the same wall — surface a clean
             # typed signal so main() stops and shows the scoreboard.
             raise UnrecoverableRunError(f"{type(e).__name__}: {msg}") from None
+    return final_text
 
     return final_text
         
