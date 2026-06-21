@@ -35,7 +35,7 @@ from prompts import build_task_prompt, build_solver_prompt, detect_task_type
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Change these three lines ──────────────────────────────
-AGENT_NAME  = "manduke_v5"          # shown on the leaderboard
+AGENT_NAME  = "manduke_v6"          # shown on the leaderboard
 AGENT_STACK = "Python / ADK / Groq" # describe your stack
 # Local Ollama (free) — needs `ollama serve` + the model pulled. Use the
 # ollama_chat/ prefix for reliable tool-calling. Swap to a "gemini-2.5-*"
@@ -49,9 +49,12 @@ AGENT_STACK = "Python / ADK / Groq" # describe your stack
 # Two-model split: a small reliable model ORCHESTRATES (drives the MCP tools),
 # a capable model SOLVES (produces the answer). They use separate Groq rate-limit
 # buckets, so heavy reasoning tokens don't starve the tool-calling loop.
-MODEL        = "groq/llama-3.3-70b-versatile"   # ORCHESTRATOR — tool calls (12k TPM, reliable)
-SOLVER_MODEL = "groq/openai/gpt-oss-120b"       # SOLVER — reasoning (separate 8k bucket; tool-less,
+# MODEL        = "groq/llama-3.3-70b-versatile"   # ORCHESTRATOR — tool calls (12k TPM, reliable)
+# SOLVER_MODEL = "groq/openai/gpt-oss-120b"       # SOLVER — reasoning (separate 8k bucket; tool-less,
                                                 # so the reasoning_content 400 never applies here)
+MODEL = "ollama/gemma2:2b"
+SOLVER_MODEL = "ollama/gemma2:2b"
+
 APP_NAME = "arena-adk-agent"
 USER_ID  = AGENT_NAME
 
@@ -282,6 +285,10 @@ def quiet_noisy_loggers() -> None:
     try:
         import litellm
         litellm.suppress_debug_info = True
+        # Drop provider-unsupported params instead of erroring. e.g. Ollama
+        # rejects parallel_tool_calls (which we set for the Groq orchestrator);
+        # Groq keeps it, Ollama silently drops it.
+        litellm.drop_params = True
     except Exception:
         pass
     for name in ("LiteLLM", "litellm", "google_adk", "google.adk", "httpx"):
