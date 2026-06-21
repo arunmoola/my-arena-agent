@@ -28,14 +28,14 @@ from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor, ConsoleLogR
 from opentelemetry.sdk.resources import Resource
 
 # ── Dynamic prompts ───────────────────────────────────────────────────────────
-from prompts import build_task_prompt, detect_task_type
+from prompts import build_task_prompt, build_solver_prompt, detect_task_type
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Change these three lines ──────────────────────────────
-AGENT_NAME  = "manduke_v2"          # shown on the leaderboard
+AGENT_NAME  = "manduke_v4"          # shown on the leaderboard
 AGENT_STACK = "Python / ADK / Groq" # describe your stack
 # Local Ollama (free) — needs `ollama serve` + the model pulled. Use the
 # ollama_chat/ prefix for reliable tool-calling. Swap to a "gemini-2.5-*"
@@ -60,12 +60,13 @@ MCP_ENDPOINT   = "https://agent-arena-623774504237.asia-southeast1.run.app/mcp"
 # Expires in ~1 hour — keep it in .env (gitignored), never commit it.
 ID_TOKEN       = os.environ["ARENA_ID_TOKEN"]
 MAX_TURNS      = 20
+MAX_WAIT_SECS  = 60.0
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TRACELOOP_API_KEY=os.environ["TRACELOOP_API_KEY"]
 GITHUB_URL="https://github.com/arunmoola/my-arena-agent"
 LINKEDIN_URL="https://linkedin.com/in/arunprasad"
 
-def _transient_retry_after(exc: Exception, max_wait: float = 30.0) -> Optional[float]:
+def _transient_retry_after(exc: Exception, max_wait: float = MAX_WAIT_SECS) -> Optional[float]:
     """Seconds to wait for a TRANSIENT per-minute (TPM) rate limit, read from the
     server's 'try again in Ns'. Returns None for per-day (TPD) caps or anything
     that isn't a short, waitable rate limit — those should bail, not wait."""
@@ -117,15 +118,6 @@ def resolve_model(model: str):
 
 
 # ── Solver (separate model, no tools) ─────────────────────────────────────────
-SOLVER_SYSTEM = (
-    "You are an expert problem solver in a competitive arena. You are given one "
-    "task (often raw logs or a question). Work out the correct FINAL ANSWER and "
-    "return ONLY that answer — no code, no explanation, no markdown, no preamble. "
-    "If the answer is a value (an IP, a number, a word, a short string), return "
-    "just that value on a single line."
-)
-
-
 async def _paced_acompletion(**kwargs):
     """litellm.acompletion with the same transient-TPM pacing as PacedLiteLlm,
     for the direct (non-ADK) solver call."""
@@ -145,20 +137,15 @@ async def _paced_acompletion(**kwargs):
 
 
 async def solve_with_model(task: dict) -> str:
-    """Produce the final answer for a task using SOLVER_MODEL — a plain completion
-    with NO tools and minimal context, so it runs on a separate rate-limit bucket
-    and returns a concise answer (not code) that is cheap for the orchestrator to
-    submit."""
-    title = task.get("title", "")
-    desc  = task.get("description", "")
+    """Produce the deliverable for a task using SOLVER_MODEL — a plain completion
+    with NO tools, on a separate rate-limit bucket. Uses the task-type-aware
+    prompt from prompts.build_solver_prompt so it adapts to whatever kind of task
+    the contest throws (code, value, debug, ...), not a one-size-fits-all prompt."""
     resp = await _paced_acompletion(
         model=SOLVER_MODEL,
-        messages=[
-            {"role": "system", "content": SOLVER_SYSTEM},
-            {"role": "user",   "content": f"Task: {title}\n\n{desc}"},
-        ],
+        messages=[{"role": "user", "content": build_solver_prompt(task)}],
         temperature=0.1,
-        max_tokens=1024,
+        max_tokens=2048,
         num_retries=0,
     )
     return (resp.choices[0].message.content or "").strip()
@@ -470,18 +457,32 @@ def make_arena_tools(state: RunState) -> list:
             },
         }, state)
 
-        # Only a response that actually carries a score is a real evaluation.
-        # Errors (bad agentId, malformed/None MCP result, ALREADY_SUBMITTED, ...)
-        # must NOT be recorded as an attempt — otherwise the scoreboard fills with
-        # phantom -1s and the agent thinks it submitted when it didn't.
-        score_match = re.search(r"Score:\s*(\d+)/100", result)
-        if score_match is None:
+        # A real evaluation comes back as JSON, e.g.
+        #   {"status":"EVALUATED","score":5,"weightedScore":3,"totalScore":3,"feedback":...}
+        # (older/text variants used "Score: N/100"). Parse either. Only skip
+        # recording when there's genuinely no score (real error / None result) —
+        # so errors don't post phantom scores AND real scores aren't dropped.
+        score       = None
+        levelled_up = "LEVEL_UP" in result
+        try:
+            data = json.loads(result)
+            if isinstance(data, dict):
+                if data.get("score") is not None:
+                    score = int(data["score"])
+                if str(data.get("status", "")).upper() == "LEVEL_UP" or data.get("levelledUp"):
+                    levelled_up = True
+        except Exception:
+            pass
+        if score is None:
+            m = re.search(r"Score:\s*(\d+)", result)
+            if m:
+                score = int(m.group(1))
+        if score is None:
             _log("WARN", f"submit_task did not return a score — not recording. "
                          f"Server said: {result[:140]}")
             return result
 
-        score       = int(score_match.group(1))
-        levelled_up = "LEVEL_UP" in result
+        levelled_up = levelled_up or score >= 70
         task_title  = state.current_task.get("title", state.task_id) if state.current_task else state.task_id
         state.record(state.current_level, task_title, score, levelled_up)
 
@@ -603,14 +604,16 @@ async def run_turn(
             for part in event.content.parts:
                 if hasattr(part, "function_call") and part.function_call:
                     fc = part.function_call
-                    args_str = str(dict(fc.args))
+                    # fc.args is None for a no-arg tool (solve_task, report_status);
+                    # dict(None) raised TypeError and aborted the whole turn.
+                    args_str = str(dict(fc.args or {}))
                     preview  = args_str[:120]
                     _log("AGENT", f"→ {fc.name}  {preview}{'...' if len(args_str) > 120 else ''}")
 
                 elif hasattr(part, "function_response") and part.function_response:
                     fr = part.function_response
-                    resp_str = str(fr.response)[:150].replace("\n", " ")
-                    _log("AGENT", f"← {fr.name}  {resp_str}{'...' if len(str(fr.response)) > 150 else ''}")
+                    resp_str = str(fr.response or "")[:150].replace("\n", " ")
+                    _log("AGENT", f"← {fr.name}  {resp_str}{'...' if len(str(fr.response or '')) > 150 else ''}")
 
                 elif hasattr(part, "text") and part.text and event.turn_complete:
                     final_text = part.text

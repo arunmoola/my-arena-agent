@@ -74,6 +74,77 @@ def _format_task(task: dict) -> str:
     return "\n".join(lines)
 
 
+# Per-type solving guidance, shared by the orchestrator prompt and the solver
+# prompt so both stay task-type-aware as the contest's task mix changes.
+TYPE_GUIDANCE = {
+    "code": (
+        "Write clean, well-commented code with docstrings, type hints, error handling, "
+        "and a brief usage example. Explain key design decisions."
+    ),
+    "debug": (
+        "Identify the root cause, provide the fixed code/config, explain why the fix works, "
+        "and suggest prevention strategies."
+    ),
+    "explain": (
+        "Use clear analogies, step-by-step breakdowns, concrete examples, and address "
+        "common misconceptions. Structure from simple to complex."
+    ),
+    "optimize": (
+        "Show before/after reasoning, provide the optimized solution, explain performance gains, "
+        "and note any trade-offs."
+    ),
+    "design": (
+        "Provide architecture overview, component breakdown, data flow, technology choices "
+        "with justification, and scalability/failure considerations."
+    ),
+    "test": (
+        "Provide a complete test suite with setup, positive/negative cases, edge cases, "
+        "and mocking strategy where applicable."
+    ),
+    "data": (
+        "Provide the data pipeline/transformation logic, schema, validation checks, "
+        "and sample outputs."
+    ),
+    "security": (
+        "Summarize threat model, provide secure code/config, explain defense mechanisms, "
+        "and include verification steps."
+    ),
+    "general": (
+        "Provide a complete, well-structured, and thorough solution with examples and reasoning."
+    ),
+}
+
+
+def build_solver_prompt(task: dict) -> str:
+    """Task-type-aware prompt for the SOLVER model (a tool-less completion).
+
+    Reuses the same detect_task_type + TYPE_GUIDANCE machinery as the orchestrator
+    prompt, but asks for the final deliverable directly (no tool calls, since the
+    orchestrator handles submission). The output of this is what gets submitted, so
+    it must be exactly what the automated evaluator expects — code for code tasks,
+    a value for value tasks — with no conversational wrapping.
+    """
+    task_type = detect_task_type(task.get("title", ""), task.get("description", ""))
+    guidance = TYPE_GUIDANCE.get(task_type, TYPE_GUIDANCE["general"])
+
+    return f"""
+You are an expert solving a task in a competitive evaluation arena.
+
+TASK ({task_type.upper()}):
+{_format_task(task)}
+
+INSTRUCTIONS:
+1. Work out the correct, complete solution.
+2. {guidance}
+3. Output ONLY the final deliverable that should be submitted for automated
+   evaluation — nothing else. If the task asks for a function or code, output the
+   complete code (e.g. a full function definition). If it asks for a specific value
+   or answer, output just that value. Do NOT include conversational text, your
+   reasoning steps, or markdown code fences unless they are part of the required
+   answer.
+""".strip()
+
+
 def build_task_prompt(task: dict, agent_id: str, task_id: str) -> str:
     """
     Single composite prompt that instructs the agent to:
@@ -82,46 +153,7 @@ def build_task_prompt(task: dict, agent_id: str, task_id: str) -> str:
       3. Call submit_task with the full solution
     """
     task_type = detect_task_type(task.get("title", ""), task.get("description", ""))
-
-    type_guidance = {
-        "code": (
-            "Write clean, well-commented code with docstrings, type hints, error handling, "
-            "and a brief usage example. Explain key design decisions."
-        ),
-        "debug": (
-            "Identify the root cause, provide the fixed code/config, explain why the fix works, "
-            "and suggest prevention strategies."
-        ),
-        "explain": (
-            "Use clear analogies, step-by-step breakdowns, concrete examples, and address "
-            "common misconceptions. Structure from simple to complex."
-        ),
-        "optimize": (
-            "Show before/after reasoning, provide the optimized solution, explain performance gains, "
-            "and note any trade-offs."
-        ),
-        "design": (
-            "Provide architecture overview, component breakdown, data flow, technology choices "
-            "with justification, and scalability/failure considerations."
-        ),
-        "test": (
-            "Provide a complete test suite with setup, positive/negative cases, edge cases, "
-            "and mocking strategy where applicable."
-        ),
-        "data": (
-            "Provide the data pipeline/transformation logic, schema, validation checks, "
-            "and sample outputs."
-        ),
-        "security": (
-            "Summarize threat model, provide secure code/config, explain defense mechanisms, "
-            "and include verification steps."
-        ),
-        "general": (
-            "Provide a complete, well-structured, and thorough solution with examples and reasoning."
-        ),
-    }
-
-    guidance = type_guidance.get(task_type, type_guidance["general"])
+    guidance = TYPE_GUIDANCE.get(task_type, TYPE_GUIDANCE["general"])
 
     return f"""
 You are assigned to execute and submit the following task immediately.
