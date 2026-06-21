@@ -46,7 +46,11 @@ AGENT_STACK = "Python / ADK / Groq" # describe your stack
 # MODEL = "groq/qwen/qwen3.6-27b"
 # MODEL = "groq/openai/gpt-oss-120b"          # strong tool calling, roomier limits but content not supported
 # MODEL = "groq/meta-llama/llama-prompt-guard-2-86m" # no tool calling support
-MODEL = "groq/llama-3.1-8b-instant"
+# Two-model split: a small reliable model ORCHESTRATES (drives the MCP tools),
+# a capable model SOLVES (produces the answer). They use separate Groq rate-limit
+# buckets, so heavy reasoning tokens don't starve the tool-calling loop.
+MODEL        = "groq/llama-3.1-8b-instant"      # ORCHESTRATOR — tool calls
+SOLVER_MODEL = "groq/llama-3.3-70b-versatile"   # SOLVER — reasoning / the answer
 APP_NAME = "arena-adk-agent"
 USER_ID  = AGENT_NAME
 
@@ -111,6 +115,54 @@ def resolve_model(model: str):
     # transient 429s in PacedLiteLlm and let run_turn bail on the rest.
     return PacedLiteLlm(model=model, num_retries=0)
 
+
+# ── Solver (separate model, no tools) ─────────────────────────────────────────
+SOLVER_SYSTEM = (
+    "You are an expert problem solver in a competitive arena. You are given one "
+    "task (often raw logs or a question). Work out the correct FINAL ANSWER and "
+    "return ONLY that answer — no code, no explanation, no markdown, no preamble. "
+    "If the answer is a value (an IP, a number, a word, a short string), return "
+    "just that value on a single line."
+)
+
+
+async def _paced_acompletion(**kwargs):
+    """litellm.acompletion with the same transient-TPM pacing as PacedLiteLlm,
+    for the direct (non-ADK) solver call."""
+    import litellm
+    attempt = 0
+    while True:
+        try:
+            return await litellm.acompletion(**kwargs)
+        except Exception as e:
+            wait = _transient_retry_after(e)
+            if wait is None or attempt >= 3:
+                raise
+            attempt += 1
+            _log("WARN", f"TPM rate limit (solver) — pacing {wait:.0f}s then retrying "
+                         f"(attempt {attempt}/3)")
+            await asyncio.sleep(wait)
+
+
+async def solve_with_model(task: dict) -> str:
+    """Produce the final answer for a task using SOLVER_MODEL — a plain completion
+    with NO tools and minimal context, so it runs on a separate rate-limit bucket
+    and returns a concise answer (not code) that is cheap for the orchestrator to
+    submit."""
+    title = task.get("title", "")
+    desc  = task.get("description", "")
+    resp = await _paced_acompletion(
+        model=SOLVER_MODEL,
+        messages=[
+            {"role": "system", "content": SOLVER_SYSTEM},
+            {"role": "user",   "content": f"Task: {title}\n\n{desc}"},
+        ],
+        temperature=0.1,
+        max_tokens=1024,
+        num_retries=0,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +199,7 @@ class RunState:
         self.level_history: list[dict] = []
 
         self.current_task: Optional[dict] = None
+        self.current_solution: str = ""
 
     def record(self, level, title, score, levelled_up):
         self.tasks_attempted += 1
@@ -161,7 +214,7 @@ class RunState:
     def scoreboard(self) -> str:
         lines = [
             f"\n{'─'*60}",
-            f"  SCOREBOARD  (run {self.run_id[:8]})  model: {resolve_model(MODEL)}",
+            f"  SCOREBOARD  (run {self.run_id[:8]})  {MODEL} + solver {SOLVER_MODEL}",
             f"{'─'*60}",
             f"  Current Level : {self.current_level}",
             f"  Total Score   : {self.total_score}",
@@ -375,6 +428,18 @@ def make_arena_tools(state: RunState) -> list:
             pass
         return result
 
+    async def solve_task() -> str:
+        """Compute the answer for the CURRENT task using the dedicated solver
+        model, and return it. Call this after get_tasks; then pass the returned
+        text to submit_task as the content."""
+        if not state.current_task:
+            return "ERROR: no current task in context. Call get_tasks first."
+        _log("AGENT", f"Solving with solver model {SOLVER_MODEL} ...")
+        answer = await solve_with_model(state.current_task)
+        state.current_solution = answer
+        _log("AGENT", f"Solver answer: {answer[:120]}{'...' if len(answer) > 120 else ''}")
+        return answer
+
     async def submit_task(agent_id: str, task_id: str, content: str) -> str:
         """Submit the complete answer for the current task for AI evaluation."""
         new_exec = str(uuid.uuid4())
@@ -397,15 +462,27 @@ def make_arena_tools(state: RunState) -> list:
             "content":     content,
             "metadata": {
                 "agent_name": AGENT_NAME, "agent_stack": AGENT_STACK,
-                "run_id": state.run_id, "execution_id": new_exec, "model": resolve_model(MODEL),
+                "run_id": state.run_id, "execution_id": new_exec,
+                # MODEL/SOLVER_MODEL are strings. Do NOT use resolve_model() here —
+                # it returns a PacedLiteLlm object, which isn't JSON-serializable
+                # and makes the whole submit_task MCP request fail (NoneType result).
+                "model": MODEL, "solver_model": SOLVER_MODEL,
             },
         }, state)
 
+        # Only a response that actually carries a score is a real evaluation.
+        # Errors (bad agentId, malformed/None MCP result, ALREADY_SUBMITTED, ...)
+        # must NOT be recorded as an attempt — otherwise the scoreboard fills with
+        # phantom -1s and the agent thinks it submitted when it didn't.
         score_match = re.search(r"Score:\s*(\d+)/100", result)
-        score       = int(score_match.group(1)) if score_match else -1
-        levelled_up = "LEVEL_UP" in result
+        if score_match is None:
+            _log("WARN", f"submit_task did not return a score — not recording. "
+                         f"Server said: {result[:140]}")
+            return result
 
-        task_title = state.current_task.get("title", state.task_id) if state.current_task else state.task_id
+        score       = int(score_match.group(1))
+        levelled_up = "LEVEL_UP" in result
+        task_title  = state.current_task.get("title", state.task_id) if state.current_task else state.task_id
         state.record(state.current_level, task_title, score, levelled_up)
 
         lu_emoji = "🚀 LEVEL_UP!" if levelled_up else ""
@@ -435,7 +512,7 @@ def make_arena_tools(state: RunState) -> list:
             f"History: {json.dumps(state.level_history, indent=2)}"
         )
 
-    return [register_agent, get_tasks, submit_task, skip_task, report_status]
+    return [register_agent, get_tasks, solve_task, submit_task, skip_task, report_status]
 
 SYSTEM_PROMPT = f"""
 You are an expert autonomous agent competing in the Agent Arena evaluation system.
@@ -444,9 +521,15 @@ Your goal is to solve tasks with exceptional quality and advance through levels.
 AVAILABLE TOOLS:
 - register_agent(name, stack): Register once at the start.
 - get_tasks(agent_id): Fetch the current task.
+- solve_task(): Compute the answer for the current task. Returns the answer text.
 - skip_task(agent_id, task_id, reason): Skip an impossible task.
 - submit_task(agent_id, task_id, content): Submit your final answer for evaluation.
 - report_status(): Report progress before stopping.
+
+HOW TO SOLVE A TASK:
+- Do NOT solve the task yourself or write code. Call solve_task() — it returns the
+  final answer. Then call submit_task with content set to EXACTLY that returned
+  text, unchanged.
 
 RULES:
 - Never submit the same task_id twice.
@@ -599,8 +682,14 @@ async def _drive(
             session_id=task_session_id,
         )
         prev_attempted = state.tasks_attempted
-        prompt = build_task_prompt(task, state.agent_id, state.task_id)
-        _log("AGENT", "Solving task (analysis + solution + submit in one turn)...")
+        prompt = (
+            f"Your current task '{task_title}' (task_id='{state.task_id}') is ready. "
+            f"Step 1: call solve_task() — it returns the final answer. "
+            f"Step 2: call submit_task(agent_id='{state.agent_id}', "
+            f"task_id='{state.task_id}', content=<the exact text solve_task returned>). "
+            f"Do not write code or solve it yourself; do not alter the answer."
+        )
+        _log("AGENT", "Orchestrating: solve_task -> submit_task ...")
         await run_turn(runner, session_service, task_session_id, prompt)
 
         # ── Verify submission ─────────────────────────────────────────────────
@@ -667,7 +756,7 @@ async def main() -> None:
     state = RunState()
 
     print(f"\n{'═'*60}")
-    print(f"  AGENT ARENA  —  {AGENT_NAME}  (model: {resolve_model(MODEL)})")
+    print(f"  AGENT ARENA  —  {AGENT_NAME}  (orchestrator: {MODEL}, solver: {SOLVER_MODEL})")
     print(f"{'═'*60}")
     _log("REGISTER", f"Agent: {AGENT_NAME}")
     _log("REGISTER", f"Run ID: {state.run_id}")
